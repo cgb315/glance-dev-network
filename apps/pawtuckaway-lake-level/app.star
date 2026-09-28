@@ -51,112 +51,205 @@ def _civil_from_days(z):
     y = y + 1 if m <= 2 else y
     return y, m, d
 
-def _latest_reading(records):
-    if not records:
-        return None
-    best = records[0]
-    for r in records:
-        if r["datetime"] > best["datetime"]:
-            best = r
-    return best
+# DESIGN. A lake cross-section is the app's identity: the water in the basin
+# sits below (or above) a white full-pool mark on the shore, so the drawdown
+# reads as a picture before the numbers do. Page 1 heroes the elevation, with
+# the gap to full pool in the state color; page 2 is the 7-day line against
+# the full-pool reference. Everything stays inside the SCROLL safe zone
+# (x 10-181) so the app never merges with its neighbours.
+
+L = 10    # safe-zone left edge
+R = 181   # safe-zone right edge
+
+GRAY = "#6E7A94"
+BANK = "#6B4423"
+GRASS = "#2E8B3A"
+WATER = "#1E6FC8"
+SURFACE = "#78DCFF"
+
+def _records(raw):
+    # Keep only readings with a numeric value; the feed can carry gaps.
+    out = []
+    if type(raw) != "list":
+        return out
+    for r in raw:
+        if type(r) != "dict":
+            continue
+        v = r.get("num_value")
+        dt = r.get("datetime")
+        if type(v) in ("int", "float") and type(dt) == "string":
+            out.append({"datetime": dt, "v": float(v)})
+    return sorted(out, key = lambda r: r["datetime"])
+
+def _num(s, fallback):
+    # float() on a bad free-text value would kill the render.
+    s = str(s).strip()
+    if not s or s.count(".") > 1:
+        return fallback
+    body = s[1:] if s.startswith("-") else s
+    if not body or body == ".":
+        return fallback
+    for ch in body.elems():
+        if ch not in "0123456789.":
+            return fallback
+    return float(s)
+
+def _inputs(ctx):
+    ts_id = str(ctx.inputs.get("timeseriesid", "")).strip()
+    normalpool = _num(ctx.inputs.get("normalpool", "250.4"), 250.4)
+    return ts_id, normalpool
+
+def _state(drawdown):
+    # One function owns word + color so they can never disagree.
+    if drawdown > 0.005:
+        return "BELOW FULL", "amber"
+    if drawdown < -0.005:
+        return "ABOVE FULL", "skyblue"
+    return "AT FULL POOL", "green"
+
+def _nodata(c, title, sub):
+    c.fill("#0B0C12")
+    _lake(c, L, 0.5)
+    cx = L + 24 + (R - L - 24) // 2
+    c.text(title, cx - c.text_width(title, font = "6x8") // 2, 8, font = "6x8", color = "#E8B04A")
+    c.text(sub, cx - c.text_width(sub, font = "4x5") // 2, 20, font = "4x5", color = "#6A7090")
+
+def _lake(c, x0, drawdown):
+    # 24x25 basin cross-section at x0..x0+23, y 4..28. Each row below the
+    # full-pool mark (y 8) is a quarter foot of drawdown.
+    full_y = 8
+    water_y = full_y + int(drawdown / 0.25 + (0.5 if drawdown >= 0 else -0.5))
+    water_y = max(5, min(26, water_y))
+    for y in range(4, 29):
+        inset = (y - 4) // 3 + 1
+        if y == 28:
+            inset = 12
+        for x in range(x0, x0 + 24):
+            off = x - x0
+            bank = off < inset or off >= 24 - inset
+            if bank:
+                top = y == 4 or (off == inset - 1 or off == 24 - inset)
+                c.pixel(x, y, GRASS if (y <= 5 and top) else BANK)
+            elif y == water_y:
+                c.pixel(x, y, SURFACE)
+            elif y > water_y:
+                c.pixel(x, y, WATER)
+            elif y == full_y and off % 2 == 0:
+                c.pixel(x, y, color.dim("white", 45))
+    # Full-pool mark on both shores.
+    for dx in (0, 1, 2, 21, 22, 23):
+        c.pixel(x0 + dx, full_y, "white")
 
 def level(c, ctx):
     c.clear()
-    ts_id = ctx.inputs.get("timeseriesid", "")
-    normalpool = float(ctx.inputs.get("normalpool", 250.4))
-
+    ts_id, normalpool = _inputs(ctx)
     if not ts_id or ts_id == "PASTE-REAL-UUID-HERE":
-        c.text_center("SET TIMESERIES ID", 12, font="5x7", color="red")
+        _nodata(c, "NO GAUGE SET", "ENTER AMANZI TIMESERIES ID")
         return
 
-    records = _fetch_values(ctx, ts_id, 2)
-    if records == None:
-        c.text_center("NO DATA", 12, font="6x8", color="red")
+    raw = _fetch_values(ctx, ts_id, 2)
+    if raw == None:
+        _nodata(c, "LAKE DATA OFFLINE", "NHDES FEED UNAVAILABLE")
+        return
+    recs = _records(raw)
+    if not recs:
+        _nodata(c, "NO RECENT READINGS", "GAUGE HAS NOT REPORTED")
         return
 
-    latest = _latest_reading(records)
-    if latest == None:
-        c.text_center("NO READINGS", 12, font="6x8", color="red")
-        return
-
-    elevation = latest["num_value"]
+    elevation = recs[-1]["v"]
     drawdown = normalpool - elevation
+    word, col = _state(drawdown)
 
-    c.header("PAWTUCKAWAY LAKE", bg="skyblue", color="black")
+    _lake(c, L, drawdown)
 
-    if drawdown > 0.005:
-        label = _fmt2(drawdown) + " FT BELOW FULL"
-        col = "amber"
-    elif drawdown < -0.005:
-        label = _fmt2(-drawdown) + " FT ABOVE FULL"
-        col = "cyan"
-    else:
-        label = "AT FULL POOL"
-        col = "green"
+    # Middle zone x 38-124: title, hero elevation, unit.
+    c.text("PAWTUCKAWAY LAKE", 38, 1, font = "4x5", color = GRAY)
+    hero = _fmt2(elevation)
+    c.text(hero, 38, 10, font = "10x16", color = "white")
+    hx = 38 + c.text_width(hero, font = "10x16") + 3
+    c.text("FT", hx, 10, font = "5x7", color = "white")
+    c.text("ELEV", hx, 20, font = "4x5", color = GRAY)
 
-    c.text(_fmt2(elevation) + " FT ELEV", 4, 13, font="6x8", color="white")
-    c.text_center(label, 25, font="4x5", color=col)
+    c.vline(128, 3, 28, color.dim("white", 25))
+
+    # Right zone x 132-181: gap to full pool, in the state color.
+    if word == "AT FULL POOL":
+        c.text("AT FULL", 132, 8, font = "6x8", color = col)
+        c.text("POOL", 132, 19, font = "6x8", color = col)
+        return
+    gap = _fmt2(drawdown if drawdown > 0 else -drawdown)
+    c.trend_arrow(132, 3, -1 if drawdown > 0 else 1, color = col)
+    c.text(gap, 140, 3, font = "7x12", color = col)
+    gx = 140 + c.text_width(gap, font = "7x12") + 2
+    if gx + 8 <= R:
+        c.text("FT", gx, 10, font = "4x5", color = col)
+    c.text(word, 132, 20, font = "5x7", color = GRAY)
 
 def trend(c, ctx):
     c.clear()
-    ts_id = ctx.inputs.get("timeseriesid", "")
-    normalpool = float(ctx.inputs.get("normalpool", 250.4))
-
+    ts_id, normalpool = _inputs(ctx)
     if not ts_id or ts_id == "PASTE-REAL-UUID-HERE":
-        c.text_center("SET TIMESERIES ID", 12, font="5x7", color="red")
+        _nodata(c, "NO GAUGE SET", "ENTER AMANZI TIMESERIES ID")
         return
 
-    records = _fetch_values(ctx, ts_id, 7)
-    if records == None or len(records) == 0:
-        c.text_center("NO DATA", 14, font="6x8", color="red")
+    raw = _fetch_values(ctx, ts_id, 7)
+    if raw == None:
+        _nodata(c, "LAKE DATA OFFLINE", "NHDES FEED UNAVAILABLE")
+        return
+    recs = _records(raw)
+    if not recs:
+        _nodata(c, "NO RECENT READINGS", "GAUGE HAS NOT REPORTED")
         return
 
-    sorted_records = sorted(records, key=lambda r: r["datetime"])
+    elevations = [r["v"] for r in recs]
+    current = elevations[-1]
 
-    elevations = [r["num_value"] for r in sorted_records]
-
-    current_elev = elevations[-1]
-    current_dd = normalpool - current_elev
-
-    target_unix = ctx.now.unix - DAY
-    target_iso = _unix_to_iso(target_unix) + "Z"
-
-    day_ago_elev = elevations[0]
-    for i in range(len(sorted_records)):
-        if sorted_records[i]["datetime"] >= target_iso:
-            day_ago_elev = elevations[i]
+    target_iso = _unix_to_iso(ctx.now.unix - DAY) + "Z"
+    day_ago = elevations[0]
+    for r in recs:
+        if r["datetime"] >= target_iso:
+            day_ago = r["v"]
             break
-
-    diff = current_elev - day_ago_elev
+    diff = current - day_ago
 
     if diff > 0.01:
-        arrow_dir = 1
-        trend_col = "green"
+        arrow_dir, trend_col = 1, "green"
     elif diff < -0.01:
-        arrow_dir = -1
-        trend_col = "red"
+        arrow_dir, trend_col = -1, "amber"
     else:
-        arrow_dir = 0
-        trend_col = "gray"
+        arrow_dir, trend_col = 0, GRAY
 
-    axis_max = max(elevations)
-    axis_min = min(elevations)
-    swing = axis_max - axis_min
-    if swing < 0.01:
-        axis_max = axis_max + 0.05
-        axis_min = axis_min - 0.05
-        swing = axis_max - axis_min
+    hi = max(elevations)
+    lo = min(elevations)
+    # Pull the full-pool line into the chart when it is close enough to read.
+    show_full = normalpool - hi <= 0.5 and lo - normalpool <= 0.5
+    axis_max = max(hi, normalpool) if show_full else hi
+    axis_min = min(lo, normalpool) if show_full else lo
+    if axis_max - axis_min < 0.1:
+        mid = (axis_max + axis_min) / 2
+        axis_max, axis_min = mid + 0.05, mid - 0.05
 
-    c.text("7-DAY LEVEL", 2, 1, font="4x5", color="gray")
+    # Header row: title left, 24h change right.
+    c.text("7-DAY LAKE LEVEL", L, 1, font = "4x5", color = GRAY)
+    chg = ("+" if diff > 0.005 else "") + _fmt2(diff) + " FT / 24H"
+    cw = c.text_width(chg, font = "4x5")
+    c.text(chg, R - cw, 1, font = "4x5", color = trend_col)
+    c.trend_arrow(R - cw - 8, 1, arrow_dir, color = trend_col)
 
-    chart_x = 2
-    chart_y = 8
-    chart_w = 150
-    chart_h = 14
+    # Chart x 10-150, y 8-30; hi/lo labels in the column to its right.
+    chart_x, chart_y, chart_w, chart_h = L, 8, 141, 23
+    c.sparkline(elevations, chart_x, chart_y, chart_w, chart_h, color = SURFACE,
+                fill = color.dim("skyblue", 30), min_val = axis_min, max_val = axis_max)
+    if show_full:
+        fy = chart_y + int((axis_max - normalpool) / (axis_max - axis_min) * (chart_h - 1) + 0.5)
+        for x in range(chart_x, chart_x + chart_w, 3):
+            c.pixel(x, fy, "white")
+        # Label the dotted line; below it when there is room, else above.
+        ly = fy + 2 if fy + 7 <= chart_y + chart_h else fy - 6
+        c.text_stroke("FULL", chart_x + chart_w - 17, ly, font = "4x5", color = "white")
 
-    c.sparkline(elevations, chart_x, chart_y, chart_w, chart_h, color="skyblue",
-                fill=color.dim("skyblue", 30), min_val=axis_min, max_val=axis_max)
-    c.trend_arrow(154, 10, arrow_dir, color=trend_col)
-
-    c.text("SWING " + _fmt2(swing), 2, 24, font="4x5", color=trend_col)
-    c.text_right("DD " + _fmt2(current_dd), 27, font="4x5", color="white")
+    c.vline(154, 8, 30, color.dim("white", 25))
+    c.text("HIGH", 158, 8, font = "4x5", color = GRAY)
+    c.text(_fmt2(hi), 158, 14, font = "4x5", color = "white")
+    c.text("LOW", 158, 20, font = "4x5", color = GRAY)
+    c.text(_fmt2(lo), 158, 26, font = "4x5", color = "white")
